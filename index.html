@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Room Planner</title>
+<meta name="description" content="Draw a floor plan, arrange furniture and plan a wall in front view - right in your browser.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='4' y='4' width='24' height='24' fill='none' stroke='%232f6fed' stroke-width='4'/%3E%3Crect x='10' y='10' width='9' height='6' fill='%232f6fed'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<header class="bar">
+  <div class="brand">Room Planner</div>
+
+  <div class="seg">
+    <button id="tabPlan" data-act="mode-plan">Floor plan</button>
+    <button id="tabWall" data-act="mode-wall">Wall view</button>
+  </div>
+
+  <div class="tools">
+    <button data-act="undo" id="btnUndo" title="Undo (Ctrl+Z)">Undo</button>
+    <button data-act="redo" id="btnRedo" title="Redo (Ctrl+Y)">Redo</button>
+    <span class="sep"></span>
+    <button data-act="snap" id="btnSnap" title="Snap to grid, walls and other items (hold Shift to bypass)">Snap</button>
+    <button data-act="measure" id="btnMeasure" title="Drag on the floor plan to measure a distance (M)">Measure</button>
+  </div>
+
+  <div class="spacer"></div>
+
+  <button data-act="collab" id="btnCollab" title="Edit this plan together with others">Collaborate</button>
+  <details class="menu">
+    <summary>File</summary>
+    <div class="menu-list">
+      <button data-act="new">New plan</button>
+      <button data-act="demo">Load example</button>
+      <hr>
+      <button data-act="open">Open file&hellip;</button>
+      <button data-act="save">Save file (.json)</button>
+      <hr>
+      <button data-act="png">Export image (.png)</button>
+      <button data-act="print">Print current view</button>
+      <button data-act="share">Copy share link</button>
+    </div>
+  </details>
+  <button data-act="theme" title="Switch light / dark theme">Theme</button>
+</header>
+
+<main>
+  <aside id="catalog" aria-label="Furniture catalog"></aside>
+
+  <section id="stage">
+    <svg id="canvas" xmlns="http://www.w3.org/2000/svg"></svg>
+
+    <div id="wallbar" hidden>
+      <button data-act="prevwall" title="Previous wall">&lsaquo;</button>
+      <select id="wallSelect" aria-label="Wall"></select>
+      <button data-act="nextwall" title="Next wall">&rsaquo;</button>
+      <label title="Furniture closer to the wall than this is shown in the wall view">
+        Show items within
+        <input id="depth" type="number" min="0" step="10"> cm
+      </label>
+    </div>
+
+    <svg id="minimap" hidden xmlns="http://www.w3.org/2000/svg"></svg>
+
+    <div id="zoom">
+      <button data-act="zoomin" title="Zoom in">+</button>
+      <button data-act="zoomout" title="Zoom out">&minus;</button>
+      <button data-act="fit" title="Fit to screen (F)">Fit</button>
+    </div>
+
+    <div id="status"><span id="hint"></span><span id="coords"></span></div>
+    <div id="toast" hidden></div>
+  </section>
+
+  <aside id="panel" aria-label="Properties"></aside>
+</main>
+
+<dialog id="collab" aria-label="Work together"></dialog>
+<div id="print"></div>
+<input type="file" id="file" accept=".json,application/json" hidden>
+<script src="js/app.js"></script>
+</body>
+</html>
