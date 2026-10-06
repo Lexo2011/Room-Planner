@@ -871,9 +871,12 @@ function draw() {
   const r = svg.getBoundingClientRect(), v = views[ui.mode], T = theme();
   if (!r.width) return;
   if (!v.fitted) fit();
+  const ease = easeStep(), restore = shiftAnims(ease);
   const o = { T, interactive: true, vp: { x: v.x, y: v.y, w: r.width / v.s, h: r.height / v.s } };
   svg.innerHTML = `<rect width="100%" height="100%" fill="${T.bg}"/>` +
-    `<g transform="translate(${f(-v.x * v.s)} ${f(-v.y * v.s)}) scale(${v.s})">${ui.mode === 'plan' ? renderPlan(v.s, o) : renderElev(v.s, o)}</g>` + remoteCursors(v);
+    `<g transform="translate(${f(-v.x * v.s)} ${f(-v.y * v.s)}) scale(${v.s})">${ui.mode === 'plan' ? renderPlan(v.s, o) : renderElev(v.s, o)}</g>` + remoteCursors(v, ease);
+  for (const [c, obj, vals] of restore) setAnimVals(c, obj, vals);
+  if (co.moving) render();
 }
 function exportSvg() {
   const b = ui.mode === 'plan' ? planBounds() : elevBounds();
@@ -1464,7 +1467,7 @@ const PEER_COLORS = ['#e5484d', '#0091ff', '#30a46c', '#f76b15', '#8e4ec6', '#d6
 const SESSION_KEY = STORAGE_KEY + '.session';
 const COLS = ['rooms', 'items', 'openings'];
 const co = { role: null, status: '', code: '', peer: null, host: null, conns: new Map(), peers: new Map(),
-  me: { id: '', name: '', color: PEER_COLORS[0] }, synced: null, attempt: 0, timer: 0, colorN: 1, lastCur: 0, lastLive: 0 };
+  me: { id: '', name: '', color: PEER_COLORS[0] }, synced: null, attempt: 0, timer: 0, colorN: 1, lastCur: 0, lastLive: 0, liveDirty: false, anims: new Map(), animT: 0, moving: false };
 
 function normCode(s) { return String(s).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6); }
 function showCode(c) { return c.slice(0, 3) + '-' + c.slice(3); }
@@ -1515,8 +1518,10 @@ function applyPatch(p) {
         // Update in place so an object someone here is dragging keeps its identity.
         const cur = state[c].find(x => x.id === o.id);
         if (cur) {
+          const was = animVals(c, cur);
           for (const k of Object.keys(cur)) if (!(k in o)) delete cur[k];
           Object.assign(cur, o);
+          glide(c, cur, was);
         } else state[c].push(o);
         co.synced[c].set(o.id, JSON.stringify(cur || o));
       }
@@ -1535,9 +1540,10 @@ function applyPatch(p) {
     return room && o.wall < room.points.length;
   });
 }
-function afterRemote() {
+function afterRemote(live) {
   if (ui.sel && !selected()) ui.sel = null;
-  if (!drag || drag.type === 'pan' || drag.type === 'measure') {
+  // Patches sent mid-drag only need a redraw; the closing patch does the bookkeeping.
+  if (!live && (!drag || drag.type === 'pan' || drag.type === 'measure')) {
     history[hIndex] = JSON.stringify(state);
     save();
     if ($('#panel').contains(document.activeElement)) buildMinimap(); else syncUi();
@@ -1550,21 +1556,68 @@ function sendAll(msg, except) {
     for (const [id, c] of co.conns) if (id !== except && c.open) c.send(msg);
   } else if (co.host && co.host.open) co.host.send(msg);
 }
-function pushChanges() {
+function pushChanges(live) {
   if (!co.role || !co.synced) return;
-  const p = makePatch();
+  let p = makePatch();
+  if (live) {
+    if (!p) return;
+    p.live = 1;
+    co.liveDirty = true;
+  } else {
+    if (!p && co.liveDirty) p = { t: 'patch', up: {}, del: {} };
+    co.liveDirty = false;
+  }
   if (p) sendAll(p);
 }
 function pushLive() {
   const now = performance.now();
-  if (now - co.lastLive < 70) return;
+  if (now - co.lastLive < 40) return;
   co.lastLive = now;
-  pushChanges();
+  pushChanges(true);
+}
+
+// Remote changes arrive a few dozen times a second. Rather than jumping, objects and cursors are
+// drawn with an offset from their true position that decays every frame.
+function animVals(c, o) {
+  return c === 'rooms' ? o.points.flatMap(q => [q.x, q.y]) : c === 'items' ? [o.x, o.y, o.z] : [o.offset, o.sill];
+}
+function setAnimVals(c, o, v) {
+  if (c === 'rooms') o.points.forEach((q, i) => { q.x = v[2 * i]; q.y = v[2 * i + 1]; });
+  else if (c === 'items') { o.x = v[0]; o.y = v[1]; o.z = v[2]; }
+  else { o.offset = v[0]; o.sill = v[1]; }
+}
+function glide(c, o, was) {
+  const key = c + ':' + o.id, now = animVals(c, o), old = co.anims.get(key);
+  co.anims.delete(key);
+  if (was.length !== now.length || (drag && (drag.it === o || drag.o === o || drag.room === o))) return;
+  const d = now.map((v, i) => was[i] - v + (old && old.d.length === now.length ? old.d[i] : 0));
+  const far = Math.max(...d.map(Math.abs));
+  if (far < 0.05 || far > 400) return;
+  co.anims.set(key, { c, id: o.id, d });
+}
+function easeStep() {
+  const now = performance.now(), dt = Math.min(100, now - co.animT || 16);
+  co.animT = now;
+  co.moving = false;
+  return Math.exp(-dt / 55);
+}
+// Moves gliding objects to where they should be drawn; draw() puts the real values back afterwards.
+function shiftAnims(k) {
+  const restore = [];
+  for (const [key, a] of co.anims) {
+    const o = state[a.c].find(x => x.id === a.id), real = o && animVals(a.c, o);
+    a.d = a.d.map(v => v * k);
+    if (!o || real.length !== a.d.length || Math.max(...a.d.map(Math.abs)) < 0.2) { co.anims.delete(key); continue; }
+    restore.push([a.c, o, real]);
+    setAnimVals(a.c, o, real.map((v, i) => v + a.d[i]));
+    co.moving = true;
+  }
+  return restore;
 }
 function sendCursor(pt) {
   if (co.status !== 'live') return;
   const now = performance.now();
-  if (pt && now - co.lastCur < 50) return;
+  if (pt && now - co.lastCur < 33) return;
   co.lastCur = now;
   const msg = { t: 'cur', x: pt ? f(pt.x) : null, y: pt ? f(pt.y) : null, mode: ui.mode, wr: ui.wall.roomId, wi: ui.wall.i };
   if (co.role === 'host') msg.from = co.me.id;
@@ -1574,14 +1627,17 @@ function cleanCur(m) {
   const ok = Number.isFinite(m.x) && Number.isFinite(m.y);
   return { x: ok ? m.x : null, y: ok ? m.y : null, mode: m.mode === 'wall' ? 'wall' : 'plan', wr: String(m.wr), wi: m.wi | 0 };
 }
-function remoteCursors(v) {
+function remoteCursors(v, k) {
   let h = '';
   for (const p of co.peers.values()) {
     const c = p.cur;
-    if (!c || c.x === null || c.mode !== ui.mode) continue;
-    if (c.mode === 'wall' && (c.wr !== ui.wall.roomId || c.wi !== ui.wall.i)) continue;
+    if (!c || c.x === null || c.mode !== ui.mode || (c.mode === 'wall' && (c.wr !== ui.wall.roomId || c.wi !== ui.wall.i))) { p.shown = null; continue; }
+    // The drawn cursor chases the reported one; it jumps only when it first appears or is far off.
+    const sh = p.shown, gap = sh ? Math.hypot(c.x - sh.x, c.y - sh.y) * v.s : Infinity;
+    if (gap > 600 || gap < 0.3) p.shown = { x: c.x, y: c.y };
+    else { sh.x = c.x + (sh.x - c.x) * k; sh.y = c.y + (sh.y - c.y) * k; co.moving = true; }
     const w = p.name.length * 6.4 + 12;
-    h += `<g transform="translate(${f((c.x - v.x) * v.s)} ${f((c.y - v.y) * v.s)})" pointer-events="none">` +
+    h += `<g transform="translate(${f((p.shown.x - v.x) * v.s)} ${f((p.shown.y - v.y) * v.s)})" pointer-events="none">` +
       `<path d="M0 0V16L4.6 12.2L7.6 18.8L10.2 17.6L7.2 11.2H13Z" fill="${p.color}" stroke="#fff" stroke-width="1.2" stroke-linejoin="round"/>` +
       `<rect x="12" y="18" width="${f(w)}" height="17" rx="5" fill="${p.color}"/>` +
       `<text x="${f(12 + w / 2)}" y="27" font-size="11" fill="#fff" text-anchor="middle" dominant-baseline="central">${esc(p.name)}</text></g>`;
@@ -1606,8 +1662,8 @@ function onData(msg, conn) {
     } else if (!co.peers.has(from)) return;
     else if (msg.t === 'patch') {
       applyPatch(msg);
-      sendAll({ t: 'patch', up: msg.up, del: msg.del, settings: msg.settings }, from);
-      afterRemote();
+      sendAll({ t: 'patch', up: msg.up, del: msg.del, settings: msg.settings, live: msg.live ? 1 : 0 }, from);
+      afterRemote(msg.live);
     } else if (msg.t === 'cur') {
       const c = cleanCur(msg);
       co.peers.get(from).cur = c;
@@ -1630,11 +1686,11 @@ function onData(msg, conn) {
     for (const p of msg.list) {
       const color = /^#[0-9a-f]{6}$/i.test(p.color) ? p.color : PEER_COLORS[0];
       if (p.id === co.me.id) co.me.color = color;
-      else co.peers.set(String(p.id), { name: String(p.name || 'Guest').slice(0, 20), color, cur: (old.get(p.id) || {}).cur });
+      else co.peers.set(String(p.id), Object.assign(old.get(p.id) || {}, { name: String(p.name || 'Guest').slice(0, 20), color }));
     }
     syncCollab(); render();
   } else if (!co.synced) return;
-  else if (msg.t === 'patch') { applyPatch(msg); afterRemote(); }
+  else if (msg.t === 'patch') { applyPatch(msg); afterRemote(msg.live); }
   else if (msg.t === 'cur') {
     const p = co.peers.get(msg.from);
     if (p) { p.cur = cleanCur(msg); render(); }
@@ -1733,6 +1789,7 @@ function leaveSession() {
   co.me.color = PEER_COLORS[0];
   co.conns.clear();
   co.peers.clear();
+  co.anims.clear();
   if (p) try { p.destroy(); } catch (e) { /* already gone */ }
   try { sessionStorage.removeItem(SESSION_KEY); } catch (e) { /* ignore */ }
   syncCollab();
