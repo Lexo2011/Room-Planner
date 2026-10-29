@@ -346,3 +346,13 @@ kbd {
   #print { display: block; }
   #print svg { width: 100%; height: auto; max-height: 95vh; }
 }
+.litres { font-style: normal; color: var(--muted); margin-left: 8px; font-size: 11px; }
+.stat.indent { padding-left: 14px; }
+.paint-room > summary { list-style: none; cursor: pointer; }
+.paint-room > summary::-webkit-details-marker { display: none; }
+.paint-room > summary .stat > span:first-child::before { content: '▸ '; color: var(--muted); }
+.paint-room[open] > summary .stat > span:first-child::before { content: '▾ '; }
+.stat[data-wall] { cursor: pointer; }
+.stat[data-wall]:hover > span:first-child { color: var(--accent); }
+.stat { gap: 8px; }
+.stat > span:last-child { white-space: nowrap; }

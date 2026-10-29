@@ -142,12 +142,11 @@ function openingX(o, W) { return W.s > 0 ? o.offset : W.L - o.offset - o.width; 
 
 // Paintable wall area of a room in cm². Openings are subtracted on both sides: a door placed on the
 // neighbour's wall also cuts this room's wall when the two walls face each other within a wall thickness.
-function wallArea(room) {
-  let gross = 0, open = 0;
+function wallAreas(room) {
   const reach = state.settings.wallT + 2;
-  room.points.forEach((_, i) => {
-    const W = wallInfo(room, i);
-    gross += W.L * room.height;
+  return room.points.map((_, i) => {
+    const W = wallInfo(room, i), gross = W.L * room.height;
+    let open = 0;
     for (const o of state.openings) {
       const r = state.rooms.find(x => x.id === o.roomId);
       if (!r) continue;
@@ -162,8 +161,8 @@ function wallArea(room) {
       const len = Math.min(W.L, Math.max(ta, tb)) - Math.max(0, Math.min(ta, tb));
       if (len > 0) open += len * Math.min(o.height, room.height);
     }
+    return { L: W.L, gross, open, hidden: 0 };
   });
-  return { gross, open, net: Math.max(0, gross - open) };
 }
 // The four sides of an item in plan, each with an outward normal, shaped like wallInfo().
 function itemFaces(it) {
@@ -187,16 +186,16 @@ function unionLength(iv) {
   return len;
 }
 // Paint area of an item marked for painting (pillars, chimneys, wall pieces): its sides, minus the parts
-// standing against a room wall or another painted item. Also returns the room wall area it hides, per room.
+// standing against a room wall or another painted item. Also returns the wall area it hides, as [room, wall, cm²].
 function itemPaint(it, otherFaces) {
-  const res = { room: state.rooms.find(r => pointInPoly(it, r.points)) || null, area: 0, hidden: new Map() };
+  const res = { room: state.rooms.find(r => pointInPoly(it, r.points)) || null, area: 0, hidden: [] };
   for (const F of itemFaces(it)) {
     const iv = [];
     for (const r of state.rooms) r.points.forEach((_, i) => {
       const c = contact(F, wallInfo(r, i));
       if (!c) return;
       iv.push(c);
-      res.hidden.set(r, (res.hidden.get(r) || 0) + (c[1] - c[0]) * clamp(r.height - it.z, 0, it.h));
+      res.hidden.push([r, i, (c[1] - c[0]) * clamp(r.height - it.z, 0, it.h)]);
       if (!res.room) res.room = r;
     });
     for (const G of otherFaces) { const c = contact(F, G); if (c) iv.push(c); }
@@ -204,22 +203,35 @@ function itemPaint(it, otherFaces) {
   }
   return res;
 }
-// Walls to paint per room: wall area minus doors and windows, minus wall hidden by painted items, plus their sides.
+// Paint per room: each wall minus its doors and windows and what painted items hide, the painted items' sides,
+// and the ceiling when it is to be painted.
 function paintAreas() {
-  const rooms = new Map(state.rooms.map(r => [r, Object.assign(wallArea(r), { hidden: 0, objects: 0 })]));
+  const rooms = new Map(state.rooms.map(r => [r, { walls: wallAreas(r), objects: [], ceiling: r.paintCeiling ? Math.abs(signedArea(r.points)) : 0 }]));
   const painted = state.items.filter(it => it.paint), faces = new Map(painted.map(it => [it, itemFaces(it)]));
   const items = new Map();
   let loose = 0;
   for (const it of painted) {
     const p = itemPaint(it, painted.filter(o => o !== it).flatMap(o => faces.get(o)));
     items.set(it, p);
-    if (p.room) rooms.get(p.room).objects += p.area; else loose += p.area;
-    for (const [r, a] of p.hidden) rooms.get(r).hidden += a;
+    if (p.room) rooms.get(p.room).objects.push({ it, area: p.area }); else loose += p.area;
+    for (const [r, i, a] of p.hidden) rooms.get(r).walls[i].hidden += a;
   }
-  for (const v of rooms.values()) v.net = Math.max(0, v.gross - v.open - v.hidden + v.objects);
+  for (const v of rooms.values()) {
+    for (const w of v.walls) w.net = Math.max(0, w.gross - w.open - w.hidden);
+    v.net = v.walls.reduce((t, w) => t + w.net, 0) + v.objects.reduce((t, o) => t + o.area, 0);
+  }
   return { rooms, items, loose };
 }
-const m2 =cm2 => (cm2 / 1e4).toFixed(2) + ' m&sup2;';
+const m2 = cm2 => (cm2 / 1e4).toFixed(2) + ' m&sup2;';
+const litres = cm2 => cm2 / 1e4 * state.settings.coats / state.settings.coverage;
+// One line of the paint lists: area plus the litres it takes.
+const paintRow = (lbl, cm2, o = {}) => `<div class="stat${o.cls ? ' ' + o.cls : ''}"${o.title ? ` title="${o.title}"` : ''}${o.wall ? ` data-wall="${o.wall}"` : ''}><span>${o.bold ? `<b>${lbl}</b>` : lbl}</span>` +
+  `<span>${o.bold ? `<b>${m2(cm2)}</b>` : m2(cm2)}<i class="litres">${litres(cm2).toFixed(1)} L</i></span></div>`;
+function wallRows(room, v, cls) {
+  return v.walls.map((w, i) => paintRow(`Wall ${i + 1} <i class="litres">${fmt(w.L)}</i>`, w.net, { cls, wall: room.id + ':' + i,
+    title: `${m2(w.gross)} wall` + (w.open ? ` − ${m2(w.open)} doors and windows` : '') + (w.hidden ? ` − ${m2(w.hidden)} behind painted objects` : '') })).join('') +
+    v.objects.map(o => paintRow(esc(o.it.name), o.area, { cls })).join('');
+}
 
 function itemsOverlap(a, b) {
   if (a.flat || b.flat) return false;
@@ -289,7 +301,7 @@ function sanitize(raw) {
   const num = (v, def) => Number.isFinite(+v) ? +v : def;
   for (const r of raw.rooms || []) {
     const pts = (r.points || []).map(p => ({ x: num(p.x, 0), y: num(p.y, 0) }));
-    if (pts.length >= 3) s.rooms.push({ id: String(r.id || uid()), name: String(r.name || 'Room'), height: clamp(num(r.height, 250), 50, 1000), floor: r.floor, noPaint: !!r.noPaint, points: pts });
+    if (pts.length >= 3) s.rooms.push({ id: String(r.id || uid()), name: String(r.name || 'Room'), height: clamp(num(r.height, 250), 50, 1000), floor: r.floor, noPaint: !!r.noPaint, paintCeiling: !!r.paintCeiling, points: pts });
   }
   for (const it of raw.items || []) {
     s.items.push({ id: String(it.id || uid()), type: String(it.type || 'box'), name: String(it.name || 'Item'),
@@ -1034,6 +1046,7 @@ function buildPanel() {
     const W = wallInfo(obj, s.i);
     h = `<h2>Wall ${s.i + 1}</h2><p class="sub">${esc(obj.name)}</p>` +
       numField('Length (cm)', 'length', W.L, 'min="10"') +
+      paintRow('To paint', paintAreas().rooms.get(obj).walls[s.i].net) +
       `<div class="btns"><button class="primary" data-act="mode-wall">Open front view</button></div>` +
       `<div class="btns"><button data-act="adddoor">Add door</button><button data-act="addwindow">Add window</button><button data-act="split">Add corner</button><button data-act="selroom">Select room</button></div>` +
       '<ul class="help"><li>Drag the wall to push it in or out.</li><li>Double-click it to open its front view.</li></ul>';
@@ -1046,13 +1059,12 @@ function buildPanel() {
       `<label class="field"><span>Floor colour</span><input type="color" data-prop="floor" value="${obj.floor || '#ffffff'}"></label>` +
       `<div class="stat"><span>Area</span><span>${(Math.abs(signedArea(obj.points)) / 1e4).toFixed(2)} m&sup2;</span></div>` +
       `<div class="stat"><span>Perimeter</span><span>${fmt(per)}</span></div>` +
-      '<h3>Walls</h3>' +
-      `<div class="stat"><span>Wall area</span><span>${m2(wa.gross)}</span></div>` +
-      `<div class="stat"><span>Doors and windows</span><span>&minus;${m2(wa.open)}</span></div>` +
-      (wa.hidden ? `<div class="stat"><span>Behind painted objects</span><span>&minus;${m2(wa.hidden)}</span></div>` : '') +
-      (wa.objects ? `<div class="stat"><span>Painted objects</span><span>+${m2(wa.objects)}</span></div>` : '') +
-      `<div class="stat"><span><b>To paint</b></span><span><b>${m2(wa.net)}</b></span></div>` +
-      `<label class="field"><span>Count in paint total</span><input type="checkbox" data-prop="paint" ${obj.noPaint ? '' : 'checked'}></label>` +
+      '<h3>Paint</h3>' +
+      `<label class="field"><span>Paint walls</span><input type="checkbox" data-prop="paint" ${obj.noPaint ? '' : 'checked'}></label>` +
+      wallRows(obj, wa) + paintRow('Walls', wa.net, { bold: true }) +
+      `<label class="field"><span>Paint ceiling</span><input type="checkbox" data-prop="ceiling" ${obj.paintCeiling ? 'checked' : ''}></label>` +
+      (obj.paintCeiling ? paintRow('Ceiling', wa.ceiling, { bold: true }) : '') +
+      '<p class="sub">Doors and windows are subtracted; hover a wall for the details. Walls are numbered as in the wall view.</p>' +
       `<div class="btns"><button class="danger" data-act="delete">Delete room</button></div>` +
       '<ul class="help"><li>Drag a corner to reshape the room.</li><li>Double-click a corner to remove it.</li><li>Select a wall and use <em>Add corner</em> for L-shapes.</li><li>Drag the blue handle to move the room with its furniture.</li></ul>';
   } else if (ui.mode === 'wall') {
@@ -1061,6 +1073,7 @@ function buildPanel() {
       ? `<p class="sub">${esc(aw.room.name)} &middot; Wall ${aw.i + 1}</p>` +
         `<div class="stat"><span>Length</span><span>${fmt(aw.W.L)}</span></div><div class="stat"><span>Ceiling height</span><span>${fmt(aw.room.height)}</span></div>` +
         `<div class="stat"><span>Items shown</span><span>${elevItems(aw.W).length}</span></div>` +
+        paintRow('To paint', paintAreas().rooms.get(aw.room).walls[aw.i].net) +
         `<div class="btns"><button data-act="adddoor">Add door</button><button data-act="addwindow">Add window</button></div>`
       : '<p class="sub">No room yet.</p>') +
       '<ul class="help"><li>Click a catalog item: it is placed against this wall in the next free spot.</li><li>Drag left/right to slide along the wall, up/down to change the mounting height.</li><li>Hold <kbd>Ctrl</kbd> to keep the height, <kbd>Shift</kbd> to place freely without snapping.</li><li>Edges snap to neighbours, the floor and the ceiling.</li><li>Everything you move here moves in the floor plan too.</li></ul>';
@@ -1073,21 +1086,29 @@ function buildPanel() {
     }
     h += `<div class="stat"><span><b>Total</b></span><span><b>${total.toFixed(2)} m&sup2;</b></span></div>` +
       `<div class="stat"><span>Furniture</span><span>${state.items.length} items</span></div>`;
-    const pa = paintAreas();
-    let walls = pa.loose;
+    const pa = paintAreas(), skipped = state.rooms.filter(r => r.noPaint), ceilings = state.rooms.filter(r => r.paintCeiling);
+    let walls = pa.loose, ceiling = 0;
     h += '<h3>Walls to paint</h3>';
     for (const r of state.rooms) {
       if (r.noPaint) continue;
-      const net = pa.rooms.get(r).net; walls += net;
-      h += `<div class="stat"><span>${esc(r.name)}</span><span>${m2(net)}</span></div>`;
+      const v = pa.rooms.get(r);
+      walls += v.net;
+      // Collapsible per room; the open state survives the panel being rebuilt.
+      h += `<details class="paint-room" data-room="${r.id}" ${paintOpen.has(r.id) ? 'open' : ''}><summary>${paintRow(esc(r.name), v.net)}</summary>${wallRows(r, v, 'indent')}</details>`;
     }
-    if (pa.loose) h += `<div class="stat"><span>Objects outside rooms</span><span>${m2(pa.loose)}</span></div>`;
-    const { coats, coverage } = state.settings, litres = walls / 1e4 * coats / coverage, skipped = state.rooms.filter(r => r.noPaint);
-    h += `<div class="stat"><span><b>Total</b></span><span><b>${m2(walls)}</b></span></div>` +
-      (skipped.length ? `<p class="sub">Not counted: ${skipped.map(r => esc(r.name)).join(', ')}</p>` : '') +
-      numField('Coats', 'coats', coats, 'min="1" max="10"') + numField('Coverage (m&sup2;/L)', 'coverage', coverage, 'min="1" max="50" step="0.5"') +
-      `<div class="stat"><span><b>Paint needed</b></span><span><b>${litres.toFixed(1)} L</b></span></div>` +
-      '<p class="sub">Doors and windows are subtracted. To paint a pillar, chimney or wall piece too, select it and tick <em>Count in paint total</em>. Coverage per coat is printed on the paint can.</p>' +
+    if (pa.loose) h += paintRow('Objects outside rooms', pa.loose);
+    h += paintRow('Total walls', walls, { bold: true }) +
+      (skipped.length ? `<p class="sub">Walls not counted: ${skipped.map(r => esc(r.name)).join(', ')}</p>` : '');
+    if (ceilings.length) {
+      h += '<h3>Ceilings to paint</h3>';
+      for (const r of ceilings) { const c = pa.rooms.get(r).ceiling; ceiling += c; h += paintRow(esc(r.name), c); }
+      h += paintRow('Total ceilings', ceiling, { bold: true });
+    }
+    h += '<h3>Paint</h3>' + numField('Coats', 'coats', state.settings.coats, 'min="1" max="10"') +
+      numField('Coverage (m&sup2;/L)', 'coverage', state.settings.coverage, 'min="1" max="50" step="0.5"') +
+      `<div class="stat"><span><b>Wall paint</b></span><span><b>${litres(walls).toFixed(1)} L</b></span></div>` +
+      (ceilings.length ? `<div class="stat"><span><b>Ceiling paint</b></span><span><b>${litres(ceiling).toFixed(1)} L</b></span></div>` : '') +
+      '<p class="sub">Click a room above to list its walls. Doors and windows are subtracted. To paint a pillar, chimney or wall piece too, select it and tick <em>Count in paint total</em>; for a ceiling, select the room and tick <em>Paint ceiling</em>. Coverage per coat is printed on the paint can.</p>' +
       '<h3>Settings</h3>' + numField('Grid size (cm)', 'grid', state.settings.grid, 'min="1" max="200"') +
       `<label class="field"><span>Wall thickness</span><input type="checkbox" data-prop="thick" ${state.settings.thick ? 'checked' : ''}></label>` +
       (state.settings.thick ? numField('Thickness (cm)', 'wallT', state.settings.wallT, 'min="1" max="100"') : '') +
@@ -1190,6 +1211,7 @@ function applyProp(prop, el) {
     else if (prop === 'height') obj.height = clamp(val, 50, 1000);
     else if (prop === 'floor') obj.floor = val;
     else if (prop === 'paint') obj.noPaint = !val;
+    else if (prop === 'ceiling') obj.paintCeiling = val;
   } else if (s.kind === 'wall' && prop === 'length') {
     setWallLength(obj, s.i, Math.max(10, val));
     views.plan.fitted = false;
@@ -1528,6 +1550,19 @@ document.addEventListener('click', e => {
   const mini = e.target.closest('[data-mini]');
   if (mini) openWall(ui.wall.roomId, +mini.dataset.mini);
 });
+// A wall row in a paint list selects that wall, which highlights it on the plan.
+$('#panel').addEventListener('click', e => {
+  const row = e.target.closest('[data-wall]');
+  if (!row) return;
+  const [id, i] = row.dataset.wall.split(':');
+  if (ui.mode === 'wall') openWall(id, +i); else select({ kind: 'wall', id, i: +i });
+});
+// Rooms expanded in the plan panel's paint list.
+const paintOpen = new Set();
+$('#panel').addEventListener('toggle', e => {
+  const id = e.target.dataset && e.target.dataset.room;
+  if (id) e.target.open ? paintOpen.add(id) : paintOpen.delete(id);
+}, true);
 $('#panel').addEventListener('change', e => {
   const el = e.target.closest('[data-prop]');
   if (el) applyProp(el.dataset.prop, el);
