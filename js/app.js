@@ -135,6 +135,33 @@ function projectItem(it, W) {
 }
 function openingX(o, W) { return W.s > 0 ? o.offset : W.L - o.offset - o.width; }
 
+// Paintable wall area of a room in cm². Openings are subtracted on both sides: a door placed on the
+// neighbour's wall also cuts this room's wall when the two walls face each other within a wall thickness.
+function wallArea(room) {
+  let gross = 0, open = 0;
+  const reach = state.settings.wallT + 2;
+  room.points.forEach((_, i) => {
+    const W = wallInfo(room, i);
+    gross += W.L * room.height;
+    for (const o of state.openings) {
+      const r = state.rooms.find(x => x.id === o.roomId);
+      if (!r) continue;
+      const V = wallInfo(r, o.wall);
+      if (r === room) { if (o.wall === i) open += o.width * o.height; continue; }
+      if (dot(V.n, W.n) > -0.99) continue;
+      const a = { x: V.A.x + V.u.x * o.offset, y: V.A.y + V.u.y * o.offset };
+      const b = { x: a.x + V.u.x * o.width, y: a.y + V.u.y * o.width };
+      const da = dot(sub(a, W.A), W.n), db = dot(sub(b, W.A), W.n);
+      if (da > 1 || db > 1 || da < -reach || db < -reach) continue;
+      const ta = dot(sub(a, W.A), W.u), tb = dot(sub(b, W.A), W.u);
+      const len = Math.min(W.L, Math.max(ta, tb)) - Math.max(0, Math.min(ta, tb));
+      if (len > 0) open += len * Math.min(o.height, room.height);
+    }
+  });
+  return { gross, open, net: Math.max(0, gross - open) };
+}
+const m2 = cm2 => (cm2 / 1e4).toFixed(2) + ' m&sup2;';
+
 function itemsOverlap(a, b) {
   if (a.flat || b.flat) return false;
   if (a.z + a.h <= b.z + 0.5 || b.z + b.h <= a.z + 0.5) return false;
@@ -157,7 +184,7 @@ function collisions() {
 }
 
 /* ---------- state ---------- */
-function blank() { return { settings: { grid: 10, snap: true, thick: true, wallT: 12 }, rooms: [], openings: [], items: [] }; }
+function blank() { return { settings: { grid: 10, snap: true, thick: true, wallT: 12, coats: 2, coverage: 7 }, rooms: [], openings: [], items: [] }; }
 function catDef(name) { for (const g of CATALOG) for (const d of g.items) if (d.name === name) return d; }
 function mkItem(def, extra) {
   return Object.assign({ id: uid(), type: def.type, name: def.name, w: def.w, d: def.d, h: def.h, z: def.z || 0,
@@ -198,10 +225,12 @@ function sanitize(raw) {
   s.settings.wallT = clamp(Number.isFinite(+s.settings.wallT) ? +s.settings.wallT : 12, 1, 100);
   s.settings.thick = s.settings.thick !== false;
   s.settings.snap = !!s.settings.snap;
+  s.settings.coats = clamp(Math.round(+s.settings.coats) || 2, 1, 10);
+  s.settings.coverage = clamp(+s.settings.coverage || 7, 1, 50);
   const num = (v, def) => Number.isFinite(+v) ? +v : def;
   for (const r of raw.rooms || []) {
     const pts = (r.points || []).map(p => ({ x: num(p.x, 0), y: num(p.y, 0) }));
-    if (pts.length >= 3) s.rooms.push({ id: String(r.id || uid()), name: String(r.name || 'Room'), height: clamp(num(r.height, 250), 50, 1000), floor: r.floor, points: pts });
+    if (pts.length >= 3) s.rooms.push({ id: String(r.id || uid()), name: String(r.name || 'Room'), height: clamp(num(r.height, 250), 50, 1000), floor: r.floor, noPaint: !!r.noPaint, points: pts });
   }
   for (const it of raw.items || []) {
     s.items.push({ id: String(it.id || uid()), type: String(it.type || 'box'), name: String(it.name || 'Item'),
@@ -943,11 +972,17 @@ function buildPanel() {
   } else if (obj && s.kind === 'room') {
     let per = 0;
     obj.points.forEach((_, i) => { per += wallInfo(obj, i).L; });
+    const wa = wallArea(obj);
     h = `<h2>${esc(obj.name)}</h2><p class="sub">Room</p>` + textField('Name', 'name', obj.name) +
       numField('Ceiling height', 'height', obj.height, 'min="50"') +
       `<label class="field"><span>Floor colour</span><input type="color" data-prop="floor" value="${obj.floor || '#ffffff'}"></label>` +
       `<div class="stat"><span>Area</span><span>${(Math.abs(signedArea(obj.points)) / 1e4).toFixed(2)} m&sup2;</span></div>` +
       `<div class="stat"><span>Perimeter</span><span>${fmt(per)}</span></div>` +
+      '<h3>Walls</h3>' +
+      `<div class="stat"><span>Wall area</span><span>${m2(wa.gross)}</span></div>` +
+      `<div class="stat"><span>Doors and windows</span><span>&minus;${m2(wa.open)}</span></div>` +
+      `<div class="stat"><span><b>To paint</b></span><span><b>${m2(wa.net)}</b></span></div>` +
+      `<label class="field"><span>Count in paint total</span><input type="checkbox" data-prop="paint" ${obj.noPaint ? '' : 'checked'}></label>` +
       `<div class="btns"><button class="danger" data-act="delete">Delete room</button></div>` +
       '<ul class="help"><li>Drag a corner to reshape the room.</li><li>Double-click a corner to remove it.</li><li>Select a wall and use <em>Add corner</em> for L-shapes.</li><li>Drag the blue handle to move the room with its furniture.</li></ul>';
   } else if (ui.mode === 'wall') {
@@ -967,7 +1002,20 @@ function buildPanel() {
       h += `<div class="stat"><span>${esc(r.name)}</span><span>${a.toFixed(2)} m&sup2;</span></div>`;
     }
     h += `<div class="stat"><span><b>Total</b></span><span><b>${total.toFixed(2)} m&sup2;</b></span></div>` +
-      `<div class="stat"><span>Furniture</span><span>${state.items.length} items</span></div>` +
+      `<div class="stat"><span>Furniture</span><span>${state.items.length} items</span></div>`;
+    let walls = 0;
+    h += '<h3>Walls to paint</h3>';
+    for (const r of state.rooms) {
+      if (r.noPaint) continue;
+      const net = wallArea(r).net; walls += net;
+      h += `<div class="stat"><span>${esc(r.name)}</span><span>${m2(net)}</span></div>`;
+    }
+    const { coats, coverage } = state.settings, litres = walls / 1e4 * coats / coverage, skipped = state.rooms.filter(r => r.noPaint);
+    h += `<div class="stat"><span><b>Total</b></span><span><b>${m2(walls)}</b></span></div>` +
+      (skipped.length ? `<p class="sub">Not counted: ${skipped.map(r => esc(r.name)).join(', ')}</p>` : '') +
+      numField('Coats', 'coats', coats, 'min="1" max="10"') + numField('Coverage (m&sup2;/L)', 'coverage', coverage, 'min="1" max="50" step="0.5"') +
+      `<div class="stat"><span><b>Paint needed</b></span><span><b>${litres.toFixed(1)} L</b></span></div>` +
+      '<p class="sub">Doors and windows are subtracted. Coverage per coat is printed on the paint can.</p>' +
       '<h3>Settings</h3>' + numField('Grid size (cm)', 'grid', state.settings.grid, 'min="1" max="200"') +
       `<label class="field"><span>Wall thickness</span><input type="checkbox" data-prop="thick" ${state.settings.thick ? 'checked' : ''}></label>` +
       (state.settings.thick ? numField('Thickness (cm)', 'wallT', state.settings.wallT, 'min="1" max="100"') : '') +
@@ -1049,6 +1097,8 @@ function applyProp(prop, el) {
     if (prop === 'grid') state.settings.grid = clamp(val, 1, 200);
     else if (prop === 'thick') state.settings.thick = val;
     else if (prop === 'wallT') state.settings.wallT = clamp(val, 1, 100);
+    else if (prop === 'coats') state.settings.coats = clamp(Math.round(val), 1, 10);
+    else if (prop === 'coverage') state.settings.coverage = clamp(val, 1, 50);
   } else if (s.kind === 'item') {
     if (prop === 'name') obj.name = val.trim() || 'Item';
     else if (prop === 'color') obj.color = val;
@@ -1066,6 +1116,7 @@ function applyProp(prop, el) {
     if (prop === 'name') obj.name = val.trim() || 'Room';
     else if (prop === 'height') obj.height = clamp(val, 50, 1000);
     else if (prop === 'floor') obj.floor = val;
+    else if (prop === 'paint') obj.noPaint = !val;
   } else if (s.kind === 'wall' && prop === 'length') {
     setWallLength(obj, s.i, Math.max(10, val));
     views.plan.fitted = false;
