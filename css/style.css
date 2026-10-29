@@ -356,3 +356,7 @@ kbd {
 .stat[data-wall]:hover > span:first-child { color: var(--accent); }
 .stat { gap: 8px; }
 .stat > span:last-child { white-space: nowrap; }
+.swatch { display: inline-block; width: 10px; height: 10px; border: 1px solid var(--border); border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+.paint-colour { display: grid; grid-template-columns: 34px 1fr auto; gap: 6px; margin-bottom: 6px; }
+.paint-colour input[type="color"] { width: 100%; height: 26px; padding: 1px; }
+.field select { width: 100%; }

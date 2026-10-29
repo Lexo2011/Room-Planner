@@ -203,10 +203,17 @@ function itemPaint(it, otherFaces) {
   }
   return res;
 }
+// Paint colour of a surface; anything unassigned, or assigned to a deleted colour, gets the first colour.
+function paintOf(id) {
+  const ps = state.settings.paints;
+  return ps.find(c => c.id === id) || ps[0];
+}
+const swatch = c => `<i class="swatch" style="background:${c.color}" title="${esc(c.name)}"></i>`;
 // Paint per room: each wall minus its doors and windows and what painted items hide, the painted items' sides,
 // and the ceiling when it is to be painted.
 function paintAreas() {
   const rooms = new Map(state.rooms.map(r => [r, { walls: wallAreas(r), objects: [], ceiling: r.paintCeiling ? Math.abs(signedArea(r.points)) : 0 }]));
+  const byColour = new Map(state.settings.paints.map(c => [c, 0])), add = (id, a) => { const c = paintOf(id); byColour.set(c, byColour.get(c) + a); };
   const painted = state.items.filter(it => it.paint), faces = new Map(painted.map(it => [it, itemFaces(it)]));
   const items = new Map();
   let loose = 0;
@@ -214,23 +221,27 @@ function paintAreas() {
     const p = itemPaint(it, painted.filter(o => o !== it).flatMap(o => faces.get(o)));
     items.set(it, p);
     if (p.room) rooms.get(p.room).objects.push({ it, area: p.area }); else loose += p.area;
+    if (!p.room || !p.room.noPaint) add(it.paintId, p.area);
     for (const [r, i, a] of p.hidden) rooms.get(r).walls[i].hidden += a;
   }
-  for (const v of rooms.values()) {
-    for (const w of v.walls) w.net = Math.max(0, w.gross - w.open - w.hidden);
+  for (const [r, v] of rooms) {
+    v.walls.forEach((w, i) => { w.net = Math.max(0, w.gross - w.open - w.hidden); if (!r.noPaint) add(r.wallPaint && r.wallPaint[i], w.net); });
     v.net = v.walls.reduce((t, w) => t + w.net, 0) + v.objects.reduce((t, o) => t + o.area, 0);
+    if (v.ceiling) add(r.ceilingPaint, v.ceiling);
   }
-  return { rooms, items, loose };
+  return { rooms, items, loose, byColour };
 }
 const m2 = cm2 => (cm2 / 1e4).toFixed(2) + ' m&sup2;';
 const litres = cm2 => cm2 / 1e4 * state.settings.coats / state.settings.coverage;
 // One line of the paint lists: area plus the litres it takes.
 const paintRow = (lbl, cm2, o = {}) => `<div class="stat${o.cls ? ' ' + o.cls : ''}"${o.title ? ` title="${o.title}"` : ''}${o.wall ? ` data-wall="${o.wall}"` : ''}><span>${o.bold ? `<b>${lbl}</b>` : lbl}</span>` +
   `<span>${o.bold ? `<b>${m2(cm2)}</b>` : m2(cm2)}<i class="litres">${litres(cm2).toFixed(1)} L</i></span></div>`;
+const paintSelect = (lbl, prop, id, extra = '') => `<label class="field"><span>${lbl}</span><select data-prop="${prop}">${extra}` +
+  state.settings.paints.map(c => `<option value="${c.id}" ${!extra && paintOf(id) === c ? 'selected' : ''}>${esc(c.name)}</option>`).join('') + '</select></label>';
 function wallRows(room, v, cls) {
-  return v.walls.map((w, i) => paintRow(`Wall ${i + 1} <i class="litres">${fmt(w.L)}</i>`, w.net, { cls, wall: room.id + ':' + i,
+  return v.walls.map((w, i) => paintRow(`${swatch(paintOf(room.wallPaint && room.wallPaint[i]))}Wall ${i + 1} <i class="litres">${fmt(w.L)}</i>`, w.net, { cls, wall: room.id + ':' + i,
     title: `${m2(w.gross)} wall` + (w.open ? ` − ${m2(w.open)} doors and windows` : '') + (w.hidden ? ` − ${m2(w.hidden)} behind painted objects` : '') })).join('') +
-    v.objects.map(o => paintRow(esc(o.it.name), o.area, { cls })).join('');
+    v.objects.map(o => paintRow(swatch(paintOf(o.it.paintId)) + esc(o.it.name), o.area, { cls })).join('');
 }
 
 function itemsOverlap(a, b) {
@@ -255,7 +266,8 @@ function collisions() {
 }
 
 /* ---------- state ---------- */
-function blank() { return { settings: { grid: 10, snap: true, thick: true, wallT: 12, coats: 2, coverage: 7 }, rooms: [], openings: [], items: [] }; }
+const defaultPaints = () => [{ id: 'white', name: 'White', color: '#ffffff' }];
+function blank() { return { settings: { grid: 10, snap: true, thick: true, wallT: 12, coats: 2, coverage: 7, paints: defaultPaints() }, rooms: [], openings: [], items: [] }; }
 function catDef(name) { for (const g of CATALOG) for (const d of g.items) if (d.name === name) return d; }
 function mkItem(def, extra) {
   return Object.assign({ id: uid(), type: def.type, name: def.name, w: def.w, d: def.d, h: def.h, z: def.z || 0,
@@ -298,16 +310,21 @@ function sanitize(raw) {
   s.settings.snap = !!s.settings.snap;
   s.settings.coats = clamp(Math.round(+s.settings.coats) || 2, 1, 10);
   s.settings.coverage = clamp(+s.settings.coverage || 7, 1, 50);
+  const hex = c => /^#[0-9a-f]{6}$/i.test(c);
+  s.settings.paints = (Array.isArray(s.settings.paints) ? s.settings.paints : []).filter(c => c && typeof c === 'object')
+    .map(c => ({ id: String(c.id || uid()), name: String(c.name || 'Colour'), color: hex(c.color) ? c.color : '#ffffff' }));
+  if (!s.settings.paints.length) s.settings.paints = defaultPaints();
   const num = (v, def) => Number.isFinite(+v) ? +v : def;
   for (const r of raw.rooms || []) {
     const pts = (r.points || []).map(p => ({ x: num(p.x, 0), y: num(p.y, 0) }));
-    if (pts.length >= 3) s.rooms.push({ id: String(r.id || uid()), name: String(r.name || 'Room'), height: clamp(num(r.height, 250), 50, 1000), floor: r.floor, noPaint: !!r.noPaint, paintCeiling: !!r.paintCeiling, points: pts });
+    if (pts.length >= 3) s.rooms.push({ id: String(r.id || uid()), name: String(r.name || 'Room'), height: clamp(num(r.height, 250), 50, 1000), floor: r.floor, noPaint: !!r.noPaint, paintCeiling: !!r.paintCeiling,
+      wallPaint: pts.map((_, i) => Array.isArray(r.wallPaint) && r.wallPaint[i] ? String(r.wallPaint[i]) : null), ceilingPaint: r.ceilingPaint ? String(r.ceilingPaint) : null, points: pts });
   }
   for (const it of raw.items || []) {
     s.items.push({ id: String(it.id || uid()), type: String(it.type || 'box'), name: String(it.name || 'Item'),
       x: num(it.x, 0), y: num(it.y, 0), w: Math.max(1, num(it.w, 50)), d: Math.max(1, num(it.d, 50)), h: Math.max(1, num(it.h, 50)),
       z: Math.max(0, num(it.z, 0)), rot: num(it.rot, 0), color: /^#[0-9a-f]{6}$/i.test(it.color) ? it.color : '#d8d8d8',
-      front: it.front, plinth: it.plinth, flat: !!it.flat, paint: !!it.paint });
+      front: it.front, plinth: it.plinth, flat: !!it.flat, paint: !!it.paint, paintId: it.paintId ? String(it.paintId) : null });
   }
   for (const o of raw.openings || []) {
     s.openings.push({ id: String(o.id || uid()), roomId: String(o.roomId), wall: num(o.wall, 0) | 0, type: o.type === 'door' ? 'door' : 'window',
@@ -327,7 +344,10 @@ function normalize() {
     return o.width >= 10;
   });
   for (const it of state.items) { it.x = f(it.x); it.y = f(it.y); it.z = f(it.z); it.rot = ((f(it.rot) % 360) + 360) % 360; }
-  for (const r of state.rooms) for (const p of r.points) { p.x = f(p.x); p.y = f(p.y); }
+  for (const r of state.rooms) {
+    for (const p of r.points) { p.x = f(p.x); p.y = f(p.y); }
+    r.wallPaint = r.points.map((_, i) => (r.wallPaint && r.wallPaint[i]) || null);
+  }
 }
 
 let state;
@@ -564,6 +584,7 @@ function setWallLength(room, i, L) {
 function splitWall(room, i) {
   const W = wallInfo(room, i), t = W.L / 2;
   room.points.splice(i + 1, 0, { x: W.A.x + W.u.x * t, y: W.A.y + W.u.y * t });
+  if (room.wallPaint) room.wallPaint.splice(i + 1, 0, room.wallPaint[i] || null);
   for (const o of state.openings) {
     if (o.roomId !== room.id) continue;
     if (o.wall > i) o.wall++;
@@ -578,6 +599,7 @@ function deleteCorner(room, i) {
   state.openings = state.openings.filter(o => o.roomId !== room.id || (o.wall !== i && o.wall !== prev));
   for (const o of state.openings) if (o.roomId === room.id && o.wall > i) o.wall--;
   room.points.splice(i, 1);
+  if (room.wallPaint) room.wallPaint.splice(i, 1);
 }
 function deleteSelection() {
   const s = ui.sel, obj = selected();
@@ -767,6 +789,14 @@ function renderPlan(s, o) {
         `<path d="${d}" fill="none" stroke="${T.wall}" stroke-width="${wt * 2}" stroke-linejoin="miter" clip-path="url(#wc-${r.id})" pointer-events="none"/>`;
   }
 
+  // With more than one paint colour, a stripe inside each wall shows the colour it gets.
+  if (state.settings.paints.length > 1) for (const r of state.rooms) {
+    if (r.noPaint) continue;
+    for (let i = 0; i < r.points.length; i++) {
+      const W = wallInfo(r, i), k = px(3), c = paintOf(r.wallPaint[i]);
+      h += `<line x1="${f(W.A.x + W.n.x * k)}" y1="${f(W.A.y + W.n.y * k)}" x2="${f(W.B.x + W.n.x * k)}" y2="${f(W.B.y + W.n.y * k)}" stroke="${c.color}" stroke-width="${f(px(5))}" pointer-events="none"><title>${esc(c.name)}</title></line>`;
+    }
+  }
   for (const r of state.rooms) {
     const c = centroid(r.points);
     h += label(c.x, c.y - px(8), r.name, { size: px(13), fill: T.text, bold: true }) +
@@ -887,6 +917,7 @@ function renderElev(s, o) {
   if (!aw) return label(0, 0, 'Add a room first, then pick one of its walls.', { size: px(14), fill: T.dim });
   const { room, W } = aw, H = room.height, L = W.L, sel = I ? ui.sel : null;
   let h = `<rect x="0" y="${-H}" width="${f(L)}" height="${H}" fill="${T.elevWall}" stroke="${T.wall}" stroke-width="${f(px(1.5))}"/>`;
+  if (!room.noPaint) h += `<rect x="0" y="${-H}" width="${f(L)}" height="${H}" fill="${paintOf(room.wallPaint[aw.i]).color}" opacity="0.55" pointer-events="none"/>`;
   if (!I) h += label(L / 2, -H - px(48), `${room.name} – Wall ${aw.i + 1}`, { size: px(14), fill: T.text, bold: true });
 
   for (let z = 0; z <= H; z += 50) {
@@ -1028,7 +1059,7 @@ function buildPanel() {
       '<h3>Position</h3>' + numField('Above floor', 'z', obj.z, 'min="0"') + numField('Rotation (&deg;)', 'rot', obj.rot, 'step="5"') +
       `<h3>Look</h3><label class="field"><span>Colour</span><input type="color" data-prop="color" value="${obj.color}"></label>` +
       `<h3>Paint</h3><label class="field"><span>Count in paint total</span><input type="checkbox" data-prop="paint" ${obj.paint ? 'checked' : ''}></label>` +
-      (obj.paint ? `<div class="stat"><span>Sides to paint</span><span>${m2(paintAreas().items.get(obj).area)}</span></div>` +
+      (obj.paint ? paintSelect('Colour', 'paintId', obj.paintId) + paintRow('Sides to paint', paintAreas().items.get(obj).area) +
         '<p class="sub">Sides against a wall or another painted object are left out, and so is the wall behind it.</p>' : '') +
       `<div class="btns"><button data-act="rotate">Rotate 90&deg;</button><button data-act="duplicate">Duplicate</button>` +
       (ui.mode === 'plan' ? '<button data-act="mode-wall">Front view</button>' : '') +
@@ -1046,6 +1077,7 @@ function buildPanel() {
     const W = wallInfo(obj, s.i);
     h = `<h2>Wall ${s.i + 1}</h2><p class="sub">${esc(obj.name)}</p>` +
       numField('Length (cm)', 'length', W.L, 'min="10"') +
+      paintSelect('Paint colour', 'wallpaint', obj.wallPaint[s.i]) +
       paintRow('To paint', paintAreas().rooms.get(obj).walls[s.i].net) +
       `<div class="btns"><button class="primary" data-act="mode-wall">Open front view</button></div>` +
       `<div class="btns"><button data-act="adddoor">Add door</button><button data-act="addwindow">Add window</button><button data-act="split">Add corner</button><button data-act="selroom">Select room</button></div>` +
@@ -1063,7 +1095,13 @@ function buildPanel() {
       `<label class="field"><span>Paint walls</span><input type="checkbox" data-prop="paint" ${obj.noPaint ? '' : 'checked'}></label>` +
       wallRows(obj, wa) + paintRow('Walls', wa.net, { bold: true }) +
       `<label class="field"><span>Paint ceiling</span><input type="checkbox" data-prop="ceiling" ${obj.paintCeiling ? 'checked' : ''}></label>` +
-      (obj.paintCeiling ? paintRow('Ceiling', wa.ceiling, { bold: true }) : '') +
+      (obj.paintCeiling ? paintRow(swatch(paintOf(obj.ceilingPaint)) + 'Ceiling', wa.ceiling, { bold: true }) : '') +
+      '<h3>Colours</h3>' +
+      (new Set(obj.wallPaint.map(id => paintOf(id))).size === 1
+        ? paintSelect('All walls', 'wallpaint:all', obj.wallPaint[0])
+        : paintSelect('All walls', 'wallpaint:all', null, '<option value="" selected>Mixed</option>')) +
+      obj.points.map((_, i) => paintSelect(`Wall ${i + 1} <i class="litres">${fmt(wallInfo(obj, i).L)}</i>`, 'wallpaint:' + i, obj.wallPaint[i])).join('') +
+      (obj.paintCeiling ? paintSelect('Ceiling', 'ceilpaint', obj.ceilingPaint) : '') +
       '<p class="sub">Doors and windows are subtracted; hover a wall for the details. Walls are numbered as in the wall view.</p>' +
       `<div class="btns"><button class="danger" data-act="delete">Delete room</button></div>` +
       '<ul class="help"><li>Drag a corner to reshape the room.</li><li>Double-click a corner to remove it.</li><li>Select a wall and use <em>Add corner</em> for L-shapes.</li><li>Drag the blue handle to move the room with its furniture.</li></ul>';
@@ -1073,6 +1111,7 @@ function buildPanel() {
       ? `<p class="sub">${esc(aw.room.name)} &middot; Wall ${aw.i + 1}</p>` +
         `<div class="stat"><span>Length</span><span>${fmt(aw.W.L)}</span></div><div class="stat"><span>Ceiling height</span><span>${fmt(aw.room.height)}</span></div>` +
         `<div class="stat"><span>Items shown</span><span>${elevItems(aw.W).length}</span></div>` +
+        paintSelect('Paint colour', 'wallpaint', aw.room.wallPaint[aw.i]) +
         paintRow('To paint', paintAreas().rooms.get(aw.room).walls[aw.i].net) +
         `<div class="btns"><button data-act="adddoor">Add door</button><button data-act="addwindow">Add window</button></div>`
       : '<p class="sub">No room yet.</p>') +
@@ -1104,11 +1143,18 @@ function buildPanel() {
       for (const r of ceilings) { const c = pa.rooms.get(r).ceiling; ceiling += c; h += paintRow(esc(r.name), c); }
       h += paintRow('Total ceilings', ceiling, { bold: true });
     }
-    h += '<h3>Paint</h3>' + numField('Coats', 'coats', state.settings.coats, 'min="1" max="10"') +
+    const ps = state.settings.paints;
+    h += '<h3>Paint per colour</h3>';
+    let all = 0;
+    for (const [c, a] of pa.byColour) { all += a; h += paintRow(swatch(c) + esc(c.name), a); }
+    h += paintRow('Total', all, { bold: true }) +
+      numField('Coats', 'coats', state.settings.coats, 'min="1" max="10"') +
       numField('Coverage (m&sup2;/L)', 'coverage', state.settings.coverage, 'min="1" max="50" step="0.5"') +
-      `<div class="stat"><span><b>Wall paint</b></span><span><b>${litres(walls).toFixed(1)} L</b></span></div>` +
-      (ceilings.length ? `<div class="stat"><span><b>Ceiling paint</b></span><span><b>${litres(ceiling).toFixed(1)} L</b></span></div>` : '') +
-      '<p class="sub">Click a room above to list its walls. Doors and windows are subtracted. To paint a pillar, chimney or wall piece too, select it and tick <em>Count in paint total</em>; for a ceiling, select the room and tick <em>Paint ceiling</em>. Coverage per coat is printed on the paint can.</p>' +
+      '<h3>Colours</h3>' + ps.map(c => `<div class="paint-colour"><input type="color" data-prop="pcolor:${c.id}" value="${c.color}" aria-label="Colour">` +
+        `<input type="text" data-prop="pname:${c.id}" value="${esc(c.name)}" aria-label="Name">` +
+        (ps.length > 1 ? `<button data-act="delpaint:${c.id}" title="Delete colour; its walls get ${esc(ps[0] === c ? ps[1].name : ps[0].name)}">&times;</button>` : '') + '</div>').join('') +
+      '<div class="btns"><button data-act="addpaint">Add colour</button></div>' +
+      `<p class="sub">Surfaces without a colour of their own get ${esc(ps[0].name)}, the first colour. Choose a wall's colour in the room's panel or by selecting the wall. Click a room above to list its walls. Doors and windows are subtracted. To paint a pillar, chimney or wall piece too, select it and tick <em>Count in paint total</em>; for a ceiling, select the room and tick <em>Paint ceiling</em>. Coverage per coat is printed on the paint can.</p>` +
       '<h3>Settings</h3>' + numField('Grid size (cm)', 'grid', state.settings.grid, 'min="1" max="200"') +
       `<label class="field"><span>Wall thickness</span><input type="checkbox" data-prop="thick" ${state.settings.thick ? 'checked' : ''}></label>` +
       (state.settings.thick ? numField('Thickness (cm)', 'wallT', state.settings.wallT, 'min="1" max="100"') : '') +
@@ -1186,7 +1232,15 @@ function applyProp(prop, el) {
   const s = ui.sel, obj = selected();
   const val = el.type === 'checkbox' ? el.checked : el.type === 'number' ? parseFloat(el.value) : el.value;
   if (el.type === 'number' && !Number.isFinite(val)) return refresh();
-  if (!obj) {
+  const [key, arg] = prop.split(':');
+  if (key === 'pname' || key === 'pcolor') {
+    const c = state.settings.paints.find(x => x.id === arg);
+    if (c && key === 'pname') c.name = val.trim() || 'Colour';
+    else if (c) c.color = val;
+  } else if (key === 'wallpaint' && !obj && ui.mode === 'wall') {
+    const aw = activeWall();
+    if (aw) aw.room.wallPaint[aw.i] = val;
+  } else if (!obj) {
     if (prop === 'grid') state.settings.grid = clamp(val, 1, 200);
     else if (prop === 'thick') state.settings.thick = val;
     else if (prop === 'wallT') state.settings.wallT = clamp(val, 1, 100);
@@ -1195,6 +1249,7 @@ function applyProp(prop, el) {
   } else if (s.kind === 'item') {
     if (prop === 'name') obj.name = val.trim() || 'Item';
     else if (prop === 'paint') obj.paint = val;
+    else if (prop === 'paintId') obj.paintId = val;
     else if (prop === 'color') obj.color = val;
     else if (prop === 'rot') obj.rot = val;
     else if (prop === 'z') obj.z = Math.max(0, val);
@@ -1212,6 +1267,12 @@ function applyProp(prop, el) {
     else if (prop === 'floor') obj.floor = val;
     else if (prop === 'paint') obj.noPaint = !val;
     else if (prop === 'ceiling') obj.paintCeiling = val;
+    else if (prop === 'ceilpaint') obj.ceilingPaint = val;
+    else if (key === 'wallpaint' && val) {
+      if (arg === 'all') obj.wallPaint = obj.points.map(() => val); else obj.wallPaint[+arg] = val;
+    }
+  } else if (s.kind === 'wall' && prop === 'wallpaint') {
+    obj.wallPaint[s.i] = val;
   } else if (s.kind === 'wall' && prop === 'length') {
     setWallLength(obj, s.i, Math.max(10, val));
     views.plan.fitted = false;
@@ -1249,6 +1310,12 @@ function stepWall(dir) {
 
 function act(name) {
   const s = ui.sel, obj = selected();
+  if (name.startsWith('delpaint:')) {
+    // Surfaces in the deleted colour fall back to the first remaining one.
+    state.settings.paints = state.settings.paints.filter(c => c.id !== name.slice(9));
+    commit(); refresh();
+    return;
+  }
   switch (name) {
     case 'mode-plan': ui.mode = 'plan'; save(); refresh(); break;
     case 'mode-wall': {
@@ -1273,6 +1340,12 @@ function act(name) {
     case 'prevwall': stepWall(-1); break;
     case 'nextwall': stepWall(1); break;
     case 'addroom': addRoom(); break;
+    case 'addpaint': {
+      const n = state.settings.paints.length + 1;
+      state.settings.paints.push({ id: uid(), name: 'Colour ' + n, color: ['#e9d8a6', '#94b3c7', '#b5c99a', '#d4a5a5', '#c3b1e1'][n % 5] });
+      commit(); refresh();
+      break;
+    }
     case 'addwallpiece':
     case 'addpillar': addItem(WALL_PARTS[name]); break;
     case 'adddoor': addOpening('door'); break;
