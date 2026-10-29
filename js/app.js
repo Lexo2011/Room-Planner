@@ -20,6 +20,11 @@ const THEMES = {
 };
 
 const WOOD = '#d9bf99', FABRIC = '#a9bbcf', KITCHEN = '#e6e2da', STEEL = '#c9ced6', BATH = '#dfeaf0';
+// Built-in wall parts; they count towards the paint total and take the ceiling height of the room they land in.
+const WALL_PARTS = {
+  addwallpiece: { type: 'box', name: 'Wall piece', w: 100, d: 12, h: 250, color: '#8a909c', paint: true },
+  addpillar: { type: 'box', name: 'Pillar', w: 30, d: 30, h: 250, color: '#8a909c', paint: true }
+};
 const CATALOG = [
   { group: 'Living', items: [
     { type: 'sofa', name: 'Sofa', w: 200, d: 90, h: 80, color: FABRIC },
@@ -160,7 +165,61 @@ function wallArea(room) {
   });
   return { gross, open, net: Math.max(0, gross - open) };
 }
-const m2 = cm2 => (cm2 / 1e4).toFixed(2) + ' m&sup2;';
+// The four sides of an item in plan, each with an outward normal, shaped like wallInfo().
+function itemFaces(it) {
+  const cs = itemCorners(it);
+  return cs.map((A, i) => {
+    const B = cs[(i + 1) % 4], d = sub(B, A), L = Math.hypot(d.x, d.y) || 1e-6, u = { x: d.x / L, y: d.y / L };
+    const mid = { x: (A.x + B.x) / 2 - it.x, y: (A.y + B.y) / 2 - it.y }, k = dot({ x: -u.y, y: u.x }, mid) < 0 ? -1 : 1;
+    return { A, B, L, u, n: { x: -u.y * k, y: u.x * k } };
+  });
+}
+// Stretch [a, b] along face F that segment S lies flat against (facing it, within 3 cm), or null.
+function contact(F, S) {
+  if (dot(F.n, S.n) > -0.99 || Math.abs(dot(sub(S.A, F.A), F.n)) > 3) return null;
+  const t0 = dot(sub(S.A, F.A), F.u), t1 = dot(sub(S.B, F.A), F.u);
+  const a = Math.max(0, Math.min(t0, t1)), b = Math.min(F.L, Math.max(t0, t1));
+  return b - a > 0.5 ? [a, b] : null;
+}
+function unionLength(iv) {
+  let len = 0, end = -Infinity;
+  for (const [a, b] of iv.sort((p, q) => p[0] - q[0])) { if (b > end) { len += b - Math.max(a, end); end = b; } }
+  return len;
+}
+// Paint area of an item marked for painting (pillars, chimneys, wall pieces): its sides, minus the parts
+// standing against a room wall or another painted item. Also returns the room wall area it hides, per room.
+function itemPaint(it, otherFaces) {
+  const res = { room: state.rooms.find(r => pointInPoly(it, r.points)) || null, area: 0, hidden: new Map() };
+  for (const F of itemFaces(it)) {
+    const iv = [];
+    for (const r of state.rooms) r.points.forEach((_, i) => {
+      const c = contact(F, wallInfo(r, i));
+      if (!c) return;
+      iv.push(c);
+      res.hidden.set(r, (res.hidden.get(r) || 0) + (c[1] - c[0]) * clamp(r.height - it.z, 0, it.h));
+      if (!res.room) res.room = r;
+    });
+    for (const G of otherFaces) { const c = contact(F, G); if (c) iv.push(c); }
+    res.area += (F.L - unionLength(iv)) * it.h;
+  }
+  return res;
+}
+// Walls to paint per room: wall area minus doors and windows, minus wall hidden by painted items, plus their sides.
+function paintAreas() {
+  const rooms = new Map(state.rooms.map(r => [r, Object.assign(wallArea(r), { hidden: 0, objects: 0 })]));
+  const painted = state.items.filter(it => it.paint), faces = new Map(painted.map(it => [it, itemFaces(it)]));
+  const items = new Map();
+  let loose = 0;
+  for (const it of painted) {
+    const p = itemPaint(it, painted.filter(o => o !== it).flatMap(o => faces.get(o)));
+    items.set(it, p);
+    if (p.room) rooms.get(p.room).objects += p.area; else loose += p.area;
+    for (const [r, a] of p.hidden) rooms.get(r).hidden += a;
+  }
+  for (const v of rooms.values()) v.net = Math.max(0, v.gross - v.open - v.hidden + v.objects);
+  return { rooms, items, loose };
+}
+const m2 =cm2 => (cm2 / 1e4).toFixed(2) + ' m&sup2;';
 
 function itemsOverlap(a, b) {
   if (a.flat || b.flat) return false;
@@ -188,7 +247,7 @@ function blank() { return { settings: { grid: 10, snap: true, thick: true, wallT
 function catDef(name) { for (const g of CATALOG) for (const d of g.items) if (d.name === name) return d; }
 function mkItem(def, extra) {
   return Object.assign({ id: uid(), type: def.type, name: def.name, w: def.w, d: def.d, h: def.h, z: def.z || 0,
-    rot: 0, x: 0, y: 0, color: def.color, front: def.front, plinth: def.plinth, flat: def.flat }, extra);
+    rot: 0, x: 0, y: 0, color: def.color, front: def.front, plinth: def.plinth, flat: def.flat, paint: !!def.paint }, extra);
 }
 function demo() {
   const s = blank(), roomId = uid();
@@ -236,7 +295,7 @@ function sanitize(raw) {
     s.items.push({ id: String(it.id || uid()), type: String(it.type || 'box'), name: String(it.name || 'Item'),
       x: num(it.x, 0), y: num(it.y, 0), w: Math.max(1, num(it.w, 50)), d: Math.max(1, num(it.d, 50)), h: Math.max(1, num(it.h, 50)),
       z: Math.max(0, num(it.z, 0)), rot: num(it.rot, 0), color: /^#[0-9a-f]{6}$/i.test(it.color) ? it.color : '#d8d8d8',
-      front: it.front, plinth: it.plinth, flat: !!it.flat });
+      front: it.front, plinth: it.plinth, flat: !!it.flat, paint: !!it.paint });
   }
   for (const o of raw.openings || []) {
     s.openings.push({ id: String(o.id || uid()), roomId: String(o.roomId), wall: num(o.wall, 0) | 0, type: o.type === 'door' ? 'door' : 'window',
@@ -437,6 +496,10 @@ function addItem(def) {
     const c = viewCentre(), g = state.settings.grid;
     it.x = Math.round(c.x / g) * g; it.y = Math.round(c.y / g) * g;
     while (state.items.some(o => Math.abs(o.x - it.x) < 1 && Math.abs(o.y - it.y) < 1)) { it.x += 20; it.y += 20; }
+  }
+  if (it.paint) {
+    const room = aw ? aw.room : state.rooms.find(r => pointInPoly(it, r.points));
+    if (room) it.h = room.height;
   }
   state.items.push(it);
   ui.sel = { kind: 'item', id: it.id };
@@ -923,6 +986,8 @@ function buildCatalog() {
     <button class="cat-item" data-act="addroom"><span class="sw"><i style="width:20px;height:15px;border-width:2px"></i></span><span class="nm">Room</span><span class="dm">4 &times; 3 m</span></button>
     <button class="cat-item" data-act="adddoor"><span class="sw"><i style="width:14px;height:20px;background:#e8dccb"></i></span><span class="nm">Door</span><span class="dm">90 &times; 205</span></button>
     <button class="cat-item" data-act="addwindow"><span class="sw"><i style="width:20px;height:16px;background:#d3e8f6"></i></span><span class="nm">Window</span><span class="dm">120 &times; 120</span></button>
+    <button class="cat-item" data-act="addwallpiece" title="A piece of wall, e.g. a partition or a recess. Counts towards the paint total."><span class="sw"><i style="width:20px;height:4px;background:#8a909c"></i></span><span class="nm">Wall piece</span><span class="dm">100 &times; 12</span></button>
+    <button class="cat-item" data-act="addpillar" title="A pillar or shaft. Counts towards the paint total."><span class="sw"><i style="width:9px;height:9px;background:#8a909c"></i></span><span class="nm">Pillar</span><span class="dm">30 &times; 30</span></button>
   </details>`;
   CATALOG.forEach((g, gi) => {
     h += `<details ${g.group === 'Kitchen' || g.group === 'Living' ? 'open' : ''}><summary>${g.group}</summary>`;
@@ -950,6 +1015,9 @@ function buildPanel() {
       '<h3>Size (cm)</h3>' + numField('Width', 'w', obj.w, 'min="1"') + numField('Depth', 'd', obj.d, 'min="1"') + numField('Height', 'h', obj.h, 'min="1"') +
       '<h3>Position</h3>' + numField('Above floor', 'z', obj.z, 'min="0"') + numField('Rotation (&deg;)', 'rot', obj.rot, 'step="5"') +
       `<h3>Look</h3><label class="field"><span>Colour</span><input type="color" data-prop="color" value="${obj.color}"></label>` +
+      `<h3>Paint</h3><label class="field"><span>Count in paint total</span><input type="checkbox" data-prop="paint" ${obj.paint ? 'checked' : ''}></label>` +
+      (obj.paint ? `<div class="stat"><span>Sides to paint</span><span>${m2(paintAreas().items.get(obj).area)}</span></div>` +
+        '<p class="sub">Sides against a wall or another painted object are left out, and so is the wall behind it.</p>' : '') +
       `<div class="btns"><button data-act="rotate">Rotate 90&deg;</button><button data-act="duplicate">Duplicate</button>` +
       (ui.mode === 'plan' ? '<button data-act="mode-wall">Front view</button>' : '') +
       `<button class="danger" data-act="delete">Delete</button></div>`;
@@ -972,7 +1040,7 @@ function buildPanel() {
   } else if (obj && s.kind === 'room') {
     let per = 0;
     obj.points.forEach((_, i) => { per += wallInfo(obj, i).L; });
-    const wa = wallArea(obj);
+    const wa = paintAreas().rooms.get(obj);
     h = `<h2>${esc(obj.name)}</h2><p class="sub">Room</p>` + textField('Name', 'name', obj.name) +
       numField('Ceiling height', 'height', obj.height, 'min="50"') +
       `<label class="field"><span>Floor colour</span><input type="color" data-prop="floor" value="${obj.floor || '#ffffff'}"></label>` +
@@ -981,6 +1049,8 @@ function buildPanel() {
       '<h3>Walls</h3>' +
       `<div class="stat"><span>Wall area</span><span>${m2(wa.gross)}</span></div>` +
       `<div class="stat"><span>Doors and windows</span><span>&minus;${m2(wa.open)}</span></div>` +
+      (wa.hidden ? `<div class="stat"><span>Behind painted objects</span><span>&minus;${m2(wa.hidden)}</span></div>` : '') +
+      (wa.objects ? `<div class="stat"><span>Painted objects</span><span>+${m2(wa.objects)}</span></div>` : '') +
       `<div class="stat"><span><b>To paint</b></span><span><b>${m2(wa.net)}</b></span></div>` +
       `<label class="field"><span>Count in paint total</span><input type="checkbox" data-prop="paint" ${obj.noPaint ? '' : 'checked'}></label>` +
       `<div class="btns"><button class="danger" data-act="delete">Delete room</button></div>` +
@@ -1003,19 +1073,21 @@ function buildPanel() {
     }
     h += `<div class="stat"><span><b>Total</b></span><span><b>${total.toFixed(2)} m&sup2;</b></span></div>` +
       `<div class="stat"><span>Furniture</span><span>${state.items.length} items</span></div>`;
-    let walls = 0;
+    const pa = paintAreas();
+    let walls = pa.loose;
     h += '<h3>Walls to paint</h3>';
     for (const r of state.rooms) {
       if (r.noPaint) continue;
-      const net = wallArea(r).net; walls += net;
+      const net = pa.rooms.get(r).net; walls += net;
       h += `<div class="stat"><span>${esc(r.name)}</span><span>${m2(net)}</span></div>`;
     }
+    if (pa.loose) h += `<div class="stat"><span>Objects outside rooms</span><span>${m2(pa.loose)}</span></div>`;
     const { coats, coverage } = state.settings, litres = walls / 1e4 * coats / coverage, skipped = state.rooms.filter(r => r.noPaint);
     h += `<div class="stat"><span><b>Total</b></span><span><b>${m2(walls)}</b></span></div>` +
       (skipped.length ? `<p class="sub">Not counted: ${skipped.map(r => esc(r.name)).join(', ')}</p>` : '') +
       numField('Coats', 'coats', coats, 'min="1" max="10"') + numField('Coverage (m&sup2;/L)', 'coverage', coverage, 'min="1" max="50" step="0.5"') +
       `<div class="stat"><span><b>Paint needed</b></span><span><b>${litres.toFixed(1)} L</b></span></div>` +
-      '<p class="sub">Doors and windows are subtracted. Coverage per coat is printed on the paint can.</p>' +
+      '<p class="sub">Doors and windows are subtracted. To paint a pillar, chimney or wall piece too, select it and tick <em>Count in paint total</em>. Coverage per coat is printed on the paint can.</p>' +
       '<h3>Settings</h3>' + numField('Grid size (cm)', 'grid', state.settings.grid, 'min="1" max="200"') +
       `<label class="field"><span>Wall thickness</span><input type="checkbox" data-prop="thick" ${state.settings.thick ? 'checked' : ''}></label>` +
       (state.settings.thick ? numField('Thickness (cm)', 'wallT', state.settings.wallT, 'min="1" max="100"') : '') +
@@ -1101,6 +1173,7 @@ function applyProp(prop, el) {
     else if (prop === 'coverage') state.settings.coverage = clamp(val, 1, 50);
   } else if (s.kind === 'item') {
     if (prop === 'name') obj.name = val.trim() || 'Item';
+    else if (prop === 'paint') obj.paint = val;
     else if (prop === 'color') obj.color = val;
     else if (prop === 'rot') obj.rot = val;
     else if (prop === 'z') obj.z = Math.max(0, val);
@@ -1178,6 +1251,8 @@ function act(name) {
     case 'prevwall': stepWall(-1); break;
     case 'nextwall': stepWall(1); break;
     case 'addroom': addRoom(); break;
+    case 'addwallpiece':
+    case 'addpillar': addItem(WALL_PARTS[name]); break;
     case 'adddoor': addOpening('door'); break;
     case 'addwindow': addOpening('window'); break;
     case 'rotate': rotateSelection(90); break;
